@@ -155,8 +155,10 @@ class ValidationRunner:
         video_vae_path: str | Path | None = None,
         audio_vae_path: str | Path | None = None,
         load_text_encoder_in_8bit: bool = False,
+        fixed_context_path: str | Path | None = None,
     ):
         self._config = config
+        self._fixed_context_path = fixed_context_path
         self._model_path = Path(model_path)
         self._video_vae_path = Path(resolve_video_vae_path(self._model_path, video_vae_path))
         # Resolved on demand: a video-only validation never touches the audio VAE, and on a
@@ -327,6 +329,23 @@ class ValidationRunner:
         prompts = [s.prompt for s in self._config.samples]
         if not prompts:
             return []
+
+        if self._fixed_context_path:
+            from ltx_trainer.utils import load_fixed_context  # noqa: PLC0415
+
+            v_ctx, a_ctx = load_fixed_context(self._fixed_context_path)
+            v_ctx = v_ctx.to(torch.bfloat16).unsqueeze(0)
+            a_ctx = a_ctx.to(torch.bfloat16).unsqueeze(0) if a_ctx is not None else None
+            logger.info("Validation uses the fixed text context (prompts ignored, no text encoder loaded)")
+            return [
+                CachedPromptEmbeddings(
+                    video_context_positive=v_ctx,
+                    audio_context_positive=a_ctx,
+                    video_context_negative=v_ctx,
+                    audio_context_negative=a_ctx,
+                )
+                for _ in prompts
+            ]
 
         init_device = _local_rank_device()
 
@@ -871,8 +890,11 @@ class ValidationRunner:
     ) -> tuple[LatentState | None, LatentState | None]:
         """Run the Euler denoising loop with CFG/STG, handling frozen modalities."""
         cfg = self._config
-        scheduler = LTX2Scheduler()
-        sigmas = scheduler.execute(steps=cfg.inference_steps).to(device).float()
+        if getattr(cfg, "sigmas", None):
+            sigmas = torch.tensor(cfg.sigmas, dtype=torch.float32, device=device)
+        else:
+            scheduler = LTX2Scheduler()
+            sigmas = scheduler.execute(steps=cfg.inference_steps).to(device).float()
         stepper = EulerDiffusionStep()
         video_present = video_state is not None
         audio_present = audio_state is not None
@@ -1189,7 +1211,7 @@ class ValidationRunner:
             raise ValueError("Cached prompt embeddings are required for validation generation")
         return (
             cached.video_context_positive.to(device),
-            cached.audio_context_positive.to(device),
+            cached.audio_context_positive.to(device) if cached.audio_context_positive is not None else None,
             cached.video_context_negative.to(device) if cached.video_context_negative is not None else None,
             cached.audio_context_negative.to(device) if cached.audio_context_negative is not None else None,
         )

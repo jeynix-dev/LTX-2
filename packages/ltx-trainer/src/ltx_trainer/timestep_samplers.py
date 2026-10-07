@@ -134,9 +134,68 @@ class ShiftedLogitNormalTimestepSampler(TimestepSampler):
         return shift
 
 
+# Noise levels the LTX distilled checkpoints are sampled at (8 steps).
+# Mirrors ltx_pipelines.utils.constants.DISTILLED_SIGMA_VALUES (last value 0.0 = clean output).
+DISTILLED_SIGMA_VALUES = [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0]
+
+
+class DiscreteSigmaTimestepSampler(TimestepSampler):
+    """Samples sigmas only from a fixed discrete set (e.g. the 8-step distilled schedule).
+
+    Training on exactly the sigmas used at inference keeps a LoRA aligned with the distilled
+    model's few-step sampler: the adapter only ever sees the noise levels it will meet when
+    sampling with that schedule.
+
+    Args:
+        sigmas: Noise levels to sample from. Defaults to the distilled schedule. A terminal
+            ``0.0`` is dropped automatically (there is no denoising step at sigma = 0).
+        weights: Optional relative sampling weights, one per sigma (after dropping 0.0).
+            Uniform when omitted.
+        jitter: Optional half-width of uniform noise added around each sigma (0 = exact values).
+    """
+
+    def __init__(
+        self,
+        sigmas: list[float] | None = None,
+        weights: list[float] | None = None,
+        jitter: float = 0.0,
+    ):
+        values = [float(s) for s in (sigmas if sigmas is not None else DISTILLED_SIGMA_VALUES)]
+        values = [s for s in values if s > 0.0]
+        if not values:
+            raise ValueError("DiscreteSigmaTimestepSampler needs at least one sigma > 0")
+        if any(s > 1.0 for s in values):
+            raise ValueError(f"Sigmas must be in (0, 1], got {values}")
+        if weights is not None and len(weights) != len(values):
+            raise ValueError(
+                f"weights has {len(weights)} entries but there are {len(values)} non-zero sigmas: {values}"
+            )
+        self.sigmas = torch.tensor(values, dtype=torch.float32)
+        w = torch.tensor(weights if weights is not None else [1.0] * len(values), dtype=torch.float32)
+        if (w < 0).any() or w.sum() <= 0:
+            raise ValueError(f"weights must be non-negative with a positive sum, got {weights}")
+        self.probs = w / w.sum()
+        self.jitter = float(jitter)
+
+    def sample(self, batch_size: int, seq_length: int | None = None, device: torch.device = None) -> torch.Tensor:  # noqa: ARG002
+        idx = torch.multinomial(self.probs, batch_size, replacement=True)
+        out = self.sigmas[idx]
+        if self.jitter > 0:
+            out = out + (torch.rand(batch_size) * 2 - 1) * self.jitter
+            out = out.clamp(1e-3, 1.0)
+        return out.to(device) if device is not None else out
+
+    def sample_for(self, batch: torch.Tensor) -> torch.Tensor:
+        if batch.ndim != 3:
+            raise ValueError(f"Batch should have 3 dimensions, got {batch.ndim}")
+        return self.sample(batch.shape[0], device=batch.device)
+
+
 SAMPLERS = {
     "uniform": UniformTimestepSampler,
     "shifted_logit_normal": ShiftedLogitNormalTimestepSampler,
+    "discrete": DiscreteSigmaTimestepSampler,
+    "distilled": DiscreteSigmaTimestepSampler,
 }
 
 

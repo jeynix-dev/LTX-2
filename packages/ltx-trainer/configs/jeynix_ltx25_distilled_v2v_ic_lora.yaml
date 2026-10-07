@@ -1,0 +1,145 @@
+# =============================================================================
+# LTX-2.5 DISTILLED - Video-to-Video IC-LoRA (distorted -> clean)
+# Trains on the exact 8-step distilled sigma schedule, so the LoRA is used at
+# inference with the same sigmas:
+#   [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0]
+#
+# Paths below are overwritten by 3_train_iclora.bat (it writes a copy of this
+# file into the output folder with the values from the bat). You can also run it
+# directly:  python scripts\train.py configs\jeynix_ltx25_distilled_v2v_ic_lora.yaml
+# NOTE: keep this file ASCII-only (Windows reads it with the default codepage).
+# =============================================================================
+
+model:
+  model_path: "G:/ComfyUI_windows_portable/ComfyUI/models/diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors"
+  # Only used when fixed_context_path is null.
+  text_encoder_path: null
+  # Convolutional decoder: same encoder weights as the diffusion VAE, but light
+  # and needs no triton/natten for validation decoding on Windows.
+  video_vae_path: "G:/ComfyUI_windows_portable/ComfyUI/models/vae/ltx-2.5-video-vae-conv-bf16.safetensors"
+  # Video only: no audio VAE, transformer built without audio blocks/weights.
+  audio_vae_path: null
+  video_only: true
+  # Fixed text context (no Gemma, no connectors) - same as Lightricks HDR IC-LoRA.
+  # null = use the cached Gemma caption embeddings.
+  fixed_context_path: "G:/ComfyUI_windows_portable/ComfyUI/models/embeddings/ltx-2.5-22b-ic-lora-sdr-to-hdr-scene-emb.safetensors"
+  training_mode: "lora"
+  load_checkpoint: null
+
+lora:
+  rank: 64
+  alpha: 64
+  dropout: 0.0
+  target_modules:
+    - "attn1.to_k"
+    - "attn1.to_q"
+    - "attn1.to_v"
+    - "attn1.to_out.0"
+    - "attn2.to_k"
+    - "attn2.to_q"
+    - "attn2.to_v"
+    - "attn2.to_out.0"
+    - "ff.net.0.proj"
+    - "ff.net.2"
+
+training_strategy:
+  name: "flexible"
+  video:
+    is_generated: true
+    latents_dir: "latents"
+    conditions:
+      # Distorted clip = in-context reference (clean, sigma 0, no loss)
+      - type: reference
+        latents_dir: "reference_latents"
+        probability: 1.0
+
+optimization:
+  learning_rate: 1e-4
+  steps: 6000
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  optimizer_type: "adamw"
+  scheduler_type: "linear"
+  scheduler_params: { }
+  enable_gradient_checkpointing: true
+
+acceleration:
+  mixed_precision_mode: "bf16"
+  # H200 (141 GB): bf16 without quantization
+  quantization: null
+  load_text_encoder_in_8bit: false
+  offload_optimizer_during_validation: false
+
+data:
+  preprocessed_data_root: "G:/Lora/LTX-2/data/upscale_1920x1088x81"
+  num_dataloader_workers: 2
+
+# -----------------------------------------------------------------------------
+# Validation: 8 steps with the distilled sigmas, no CFG / STG (distilled model)
+# Hold-out clips (excluded from training by 2_prepare_dataset.bat)
+# -----------------------------------------------------------------------------
+validation:
+  samples:
+    - prompt: "up"
+      conditions:
+        - type: reference
+          video: "E:/PROJECT_UPSKALE/Dataset/control_video/Tenet_scene2191_000.mp4"
+          downscale_factor: 1
+          temporal_scale_factor: 1
+          include_in_output: true
+    - prompt: "up"
+      conditions:
+        - type: reference
+          video: "E:/PROJECT_UPSKALE/Dataset/control_video/26_Dunkirk_scene1545_000.mp4"
+          downscale_factor: 1
+          temporal_scale_factor: 1
+          include_in_output: true
+  negative_prompt: ""
+  video_dims: [ 1920, 1088, 81 ]
+  frame_rate: 24.0
+  seed: 42
+  sigmas: [ 1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0 ]
+  inference_steps: 8
+  interval: 500
+  video_cfg_scale: 1.0
+  audio_cfg_scale: 1.0
+  video_stg_scale: 0.0
+  audio_stg_scale: 0.0
+  stg_blocks: [ 28 ]
+  guidance_rescale: 0.0
+  video_modality_guidance_scale: 1.0
+  audio_modality_guidance_scale: 1.0
+  generate_audio: false
+  skip_initial_validation: false
+
+checkpoints:
+  interval: 500
+  keep_last_n: -1
+  precision: "bfloat16"
+
+# -----------------------------------------------------------------------------
+# Training sigmas: sampled ONLY from the 8 distilled noise levels (0.0 dropped).
+#   weights: optional, one per sigma (8 values), e.g. to favour the detail steps
+#   jitter:  optional +-noise around each sigma (0 = exact values)
+# -----------------------------------------------------------------------------
+flow_matching:
+  timestep_sampling_mode: "distilled"
+  timestep_sampling_params:
+    sigmas: [ 1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875 ]
+    weights: null
+    jitter: 0.0
+
+hub:
+  push_to_hub: false
+  hub_model_id: null
+
+wandb:
+  enabled: false
+  project: "ltx-2-trainer"
+  entity: null
+  tags: [ "ltx2.5", "ic-lora", "v2v", "distilled" ]
+  log_validation_videos: true
+
+seed: 42
+output_dir: "G:/Lora/LTX-2/outputs/ltx25_distilled_upscale_iclora"

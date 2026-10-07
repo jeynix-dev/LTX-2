@@ -270,6 +270,32 @@ class ModelConfig(ConfigBaseModel):
 
         return v
 
+    fixed_context_path: str | Path | None = Field(
+        default=None,
+        description=(
+            "Optional .safetensors with a fixed text context (keys video_context / audio_context, e.g. "
+            "ltx-2.5-22b-ic-lora-sdr-to-hdr-scene-emb.safetensors). When set, the text encoder AND the "
+            "embedding connectors are bypassed: this tensor is fed to the transformer as-is for every "
+            "training sample and validation sample, exactly like HDRICLoraPipeline does at inference."
+        ),
+    )
+
+    video_only: bool = Field(
+        default=False,
+        description=(
+            "Build the transformer as VIDEO-ONLY (LTXVideoOnlyModelConfigurator): audio blocks, audio<->video "
+            "cross-attention and audio weights are not created/loaded. Equivalent to the AV model with audio "
+            "disabled, but less VRAM. LoRA keys stay compatible with the full AV model."
+        ),
+    )
+
+    @field_validator("fixed_context_path")
+    @classmethod
+    def validate_fixed_context_path(cls, v: str | Path | None) -> str | Path | None:
+        if v is not None and not Path(v).is_file():
+            raise ValueError(f"fixed_context_path does not exist or is not a file: {v}")
+        return v
+
     @field_validator("video_vae_path", "audio_vae_path")
     @classmethod
     def validate_component_path(cls, v: str | Path | None) -> str | Path | None:
@@ -499,6 +525,23 @@ class ValidationConfig(ConfigBaseModel):
         description="Number of inference steps for validation",
         gt=0,
     )
+
+    sigmas: list[float] | None = Field(
+        default=None,
+        description="Explicit sigma schedule for validation sampling (e.g. the 8-step distilled schedule "
+        "[1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0]). Must be strictly "
+        "decreasing and end with 0.0. When set, overrides the LTX2Scheduler and inference_steps is "
+        "forced to len(sigmas) - 1.",
+    )
+
+    @model_validator(mode="after")
+    def _apply_explicit_sigmas(self) -> "ValidationConfig":
+        if self.sigmas is not None:
+            s = [float(x) for x in self.sigmas]
+            if len(s) < 2 or s[-1] != 0.0 or any(a <= b for a, b in zip(s, s[1:], strict=False)):
+                raise ValueError(f"validation.sigmas must be strictly decreasing and end with 0.0, got {s}")
+            object.__setattr__(self, "inference_steps", len(s) - 1)
+        return self
 
     interval: int | None = Field(
         default=100,
@@ -768,7 +811,7 @@ class WandbConfig(ConfigBaseModel):
 class FlowMatchingConfig(ConfigBaseModel):
     """Configuration for flow matching training"""
 
-    timestep_sampling_mode: Literal["uniform", "shifted_logit_normal"] = Field(
+    timestep_sampling_mode: Literal["uniform", "shifted_logit_normal", "discrete", "distilled"] = Field(
         default="shifted_logit_normal",
         description="Mode to use for timestep sampling",
     )
@@ -809,6 +852,12 @@ class LtxTrainerConfig(ConfigBaseModel):
         description="Directory to save model outputs",
     )
 
+    tensorboard: bool = Field(
+        default=True,
+        description="Write TensorBoard logs to <output_dir>/tensorboard (needs the `tensorboard` package; "
+        "silently skipped if it is not installed). A CSV log <output_dir>/train_log.csv is always written.",
+    )
+
     # noinspection PyNestedDecorators
     @field_validator("output_dir")
     @classmethod
@@ -820,6 +869,8 @@ class LtxTrainerConfig(ConfigBaseModel):
         """Verify that every directory declared by the training strategy exists under the data root."""
         data_root = Path(self.data.preprocessed_data_root)
         for dir_name in self.training_strategy.get_data_sources():
+            if dir_name == "conditions" and self.model.fixed_context_path:
+                continue  # fixed context: caption embeddings are not used
             dir_path = data_root / dir_name
             if not dir_path.is_dir():
                 raise ValueError(
