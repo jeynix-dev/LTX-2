@@ -108,9 +108,22 @@ class LtxvTrainer:
 
         # ValidationRunner loads its own models (text encoder, VAE encoder/decoder, etc.),
         # caches prompt embeddings and conditioning media, then unloads encoders.
+        self._fixed_context = None
+        if self._config.model.fixed_context_path:
+            from ltx_trainer.utils import load_fixed_context  # noqa: PLC0415
+
+            self._fixed_context = load_fixed_context(self._config.model.fixed_context_path)
+            logger.info(
+                f"Using FIXED text context from {self._config.model.fixed_context_path} "
+                f"(video {tuple(self._fixed_context[0].shape)}, "
+                f"audio {None if self._fixed_context[1] is None else tuple(self._fixed_context[1].shape)}) "
+                "- text encoder and connectors are bypassed"
+            )
+
         self._validation_runner = ValidationRunner(
             config=self._config.validation,
             model_path=self._config.model.model_path,
+            fixed_context_path=self._config.model.fixed_context_path,
             text_encoder_path=self._config.model.text_encoder_path,
             video_vae_path=self._config.model.video_vae_path,
             audio_vae_path=self._config.model.audio_vae_path,
@@ -130,6 +143,13 @@ class LtxvTrainer:
         self._training_state_size_warned = False
         self._sigma_tracker = SigmaBucketTracker()
         self._wandb_run = None
+        self._tb_writer = None
+        self._csv_file = None
+        self._csv_writer = None
+        self._csv_fields: list[str] | None = None
+        self._loss_ema: float | None = None
+        if IS_MAIN_PROCESS:
+            self._init_local_loggers()
 
     def train(  # noqa: PLR0912, PLR0915
         self,
@@ -293,6 +313,16 @@ class LtxvTrainer:
                             "train/global_step": self._global_step,
                         }
                         metrics.update(self._sigma_tracker.get_metrics())
+                        # Exact per-sigma loss (useful with the discrete distilled sigma sampler)
+                        sigmas_now = output.sigma.detach().float().cpu().tolist()
+                        losses_now = output.loss.detach().float().cpu().tolist()
+                        metrics["train/sigma"] = sum(sigmas_now) / len(sigmas_now)
+                        for sg, ls in zip(sigmas_now, losses_now, strict=True):
+                            metrics[f"loss_by_sigma/{sg:.6f}".rstrip("0").rstrip(".")] = ls
+                        self._loss_ema = (
+                            step_loss if self._loss_ema is None else 0.98 * self._loss_ema + 0.02 * step_loss
+                        )
+                        metrics["train/loss_ema"] = self._loss_ema
                         self._log_metrics(metrics)
 
                     # Fallback logging when progress bars are disabled
@@ -357,6 +387,12 @@ class LtxvTrainer:
                 )
                 self._wandb_run.finish()
 
+        if self._tb_writer is not None:
+            self._tb_writer.flush()
+            self._tb_writer.close()
+        if self._csv_file is not None:
+            self._csv_file.close()
+
         self._accelerator.wait_for_everyone()
         self._accelerator.end_training()
 
@@ -365,6 +401,23 @@ class LtxvTrainer:
     def _training_step(self, batch: dict[str, dict[str, Tensor]]) -> TrainingStepOutput:
         """Perform a single training step using the configured strategy."""
         # Apply embedding connectors to transform pre-computed text embeddings
+        if self._fixed_context is not None:
+            # Fixed context (e.g. HDR scene embedding): bypass text encoder + connectors entirely.
+            conditions = batch.setdefault("conditions", {})
+            ref = _first_tensor(batch)
+            bsz, device = ref.shape[0], ref.device
+            v_ctx, a_ctx = self._fixed_context
+            v_ctx = v_ctx.to(device=device, dtype=torch.bfloat16)
+            conditions["video_prompt_embeds"] = v_ctx.unsqueeze(0).expand(bsz, -1, -1)
+            conditions["audio_prompt_embeds"] = (
+                a_ctx.to(device=device, dtype=torch.bfloat16).unsqueeze(0).expand(bsz, -1, -1)
+                if a_ctx is not None
+                else None
+            )
+            # No mask (all tokens valid), as HDRICLoraPipeline does -> unmasked attention path (FlashAttention3)
+            conditions["prompt_attention_mask"] = None
+            return self._forward_and_loss(batch)
+
         conditions = batch["conditions"]
 
         if "video_prompt_embeds" in conditions:
@@ -385,7 +438,10 @@ class LtxvTrainer:
         conditions["video_prompt_embeds"] = video_embeds
         conditions["audio_prompt_embeds"] = audio_embeds
         conditions["prompt_attention_mask"] = attention_mask
+        return self._forward_and_loss(batch)
 
+    def _forward_and_loss(self, batch: dict[str, dict[str, Tensor]]) -> TrainingStepOutput:
+        """Strategy inputs -> transformer forward -> loss (conditions already hold final context)."""
         # Use strategy to prepare training inputs (returns ModelInputs with Modality objects)
         model_inputs = self._training_strategy.prepare_training_inputs(batch, self._timestep_sampler)
 
@@ -414,24 +470,30 @@ class LtxvTrainer:
             checkpoint_path=self._config.model.model_path,
             device="cpu",
             dtype=torch.bfloat16,
+            video_only=self._config.model.video_only,
         )
+        if self._config.model.video_only:
+            logger.info("Transformer built VIDEO-ONLY (audio blocks and weights not loaded)")
 
         # DDP-safe: LOCAL_RANK is set by accelerate before trainer init. Loading on bare
         # "cuda" would resolve to cuda:0 on every rank and crash with a device mismatch.
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         init_device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
-        logger.debug("Loading embeddings processor...")
-        self._embeddings_processor = load_embeddings_processor(
-            checkpoint_path=embedding_weight_paths(
-                self._config.model.model_path,
-                self._config.model.text_encoder_path,
-            ),
-            gemma_model_path=self._config.model.text_encoder_path,
-            device=init_device,
-            dtype=torch.bfloat16,
-        )
-        self._embeddings_processor.feature_extractor = None
+        if self._fixed_context is not None:
+            self._embeddings_processor = None  # fixed context: connectors are bypassed, nothing to load
+        else:
+            logger.debug("Loading embeddings processor...")
+            self._embeddings_processor = load_embeddings_processor(
+                checkpoint_path=embedding_weight_paths(
+                    self._config.model.model_path,
+                    self._config.model.text_encoder_path,
+                ),
+                gemma_model_path=self._config.model.text_encoder_path,
+                device=init_device,
+                dtype=torch.bfloat16,
+            )
+            self._embeddings_processor.feature_extractor = None
 
         transformer_dtype = torch.bfloat16 if self._config.model.training_mode == "lora" else torch.float32
         self._transformer = self._transformer.to(dtype=transformer_dtype)
@@ -677,6 +739,8 @@ class LtxvTrainer:
         if self._dataset is None:
             # Get data sources from the training strategy
             data_sources = self._config.training_strategy.get_data_sources()
+            if self._fixed_context is not None:
+                data_sources.pop("conditions", None)  # caption embeddings unused with a fixed context
 
             self._dataset = PrecomputedDataset(self._config.data.preprocessed_data_root, data_sources=data_sources)
             logger.debug(f"Loaded dataset with {len(self._dataset):,} samples from sources: {list(data_sources)}")
@@ -1123,7 +1187,78 @@ class LtxvTrainer:
         run = wandb.init(**init_kwargs)
         self._wandb_run = run
 
+    def _init_local_loggers(self) -> None:
+        """TensorBoard (optional) + CSV logging into the output directory."""
+        out = Path(self._config.output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        if self._config.tensorboard:
+            try:
+                from torch.utils.tensorboard import SummaryWriter  # noqa: PLC0415
+
+                self._tb_writer = SummaryWriter(log_dir=str(out / "tensorboard"), flush_secs=30)
+                logger.info(f"TensorBoard logs: {out / 'tensorboard'}")
+            except Exception as e:  # tensorboard package missing etc.
+                logger.warning(f"TensorBoard disabled ({e}). Install it with: pip install tensorboard")
+        import csv  # noqa: PLC0415
+
+        csv_path = out / "train_log.csv"
+        self._csv_file = open(csv_path, "a", newline="", encoding="utf-8")  # noqa: SIM115
+        self._csv_writer = csv
+        logger.info(f"CSV loss log: {csv_path}")
+
+    def _log_local(self, metrics: dict[str, float]) -> None:
+        step = int(metrics.get("train/global_step", self._global_step))
+        if self._tb_writer is not None:
+            for k, v in metrics.items():
+                if k != "train/global_step" and isinstance(v, (int, float)):
+                    self._tb_writer.add_scalar(k, v, step)
+        if self._csv_file is not None and "train/loss" in metrics:
+            row = {
+                "step": step,
+                "loss": metrics.get("train/loss"),
+                "loss_ema": metrics.get("train/loss_ema"),
+                "sigma": metrics.get("train/sigma"),
+                "lr": metrics.get("train/learning_rate"),
+                "step_time": metrics.get("train/step_time"),
+                "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            if self._csv_fields is None:
+                self._csv_fields = list(row)
+                w = self._csv_writer.DictWriter(self._csv_file, fieldnames=self._csv_fields)
+                if self._csv_file.tell() == 0:
+                    w.writeheader()
+            self._csv_writer.DictWriter(self._csv_file, fieldnames=self._csv_fields).writerow(row)
+            self._csv_file.flush()
+
     def _log_metrics(self, metrics: dict[str, float]) -> None:
-        """Log metrics to Weights & Biases."""
+        """Log metrics to Weights & Biases, TensorBoard and CSV."""
         if self._wandb_run is not None:
             self._wandb_run.log(metrics)
+        try:
+            self._log_local(metrics)
+        except Exception as e:  # never break training because of logging
+            logger.warning(f"Local metric logging failed: {e}")
+
+
+def _first_tensor(obj: object) -> Tensor:
+    """Return the first tensor found in a (nested) batch structure."""
+    if isinstance(obj, Tensor):
+        return obj
+    if isinstance(obj, dict):
+        for v in obj.values():
+            t = _first_tensor_or_none(v)
+            if t is not None:
+                return t
+    if isinstance(obj, (list, tuple)):
+        for v in obj:
+            t = _first_tensor_or_none(v)
+            if t is not None:
+                return t
+    raise ValueError("No tensor found in batch")
+
+
+def _first_tensor_or_none(obj: object) -> Tensor | None:
+    try:
+        return _first_tensor(obj)
+    except ValueError:
+        return None

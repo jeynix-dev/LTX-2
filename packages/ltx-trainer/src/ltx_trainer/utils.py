@@ -86,3 +86,23 @@ def save_image(image_tensor: torch.Tensor, output_path: Path | str) -> None:
 
     # Save using PIL
     Image.fromarray(image_np).save(output_path)
+
+
+def load_fixed_context(path: str | Path) -> tuple["torch.Tensor", "torch.Tensor | None"]:
+    """Load a fixed transformer text context (video_context [S, Dv], audio_context [S, Da] or None).
+
+    Accepts HDRICLoraPipeline-style files (``video_context`` / ``audio_context``) and trainer-style
+    names (``video_prompt_embeds`` / ``audio_prompt_embeds``). A leading batch dim of 1 is dropped.
+    """
+    from safetensors.torch import load_file  # noqa: PLC0415
+
+    tensors = load_file(str(path), device="cpu")
+    video = tensors.get("video_context", tensors.get("video_prompt_embeds"))
+    audio = tensors.get("audio_context", tensors.get("audio_prompt_embeds"))
+    if video is None:
+        raise KeyError(f"video_context not found in {path} (keys={list(tensors)})")
+    if video.ndim == 3:
+        video = video[0]
+    if audio is not None and audio.ndim == 3:
+        audio = audio[0]
+    return video, audio

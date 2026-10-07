@@ -146,6 +146,7 @@ def load_transformer(
     checkpoint_path: str | Path,
     device: Device = "cpu",
     dtype: torch.dtype = torch.bfloat16,
+    video_only: bool = False,
 ) -> "LTXModel":
     """Load the LTX transformer model.
     Args:
@@ -159,11 +160,12 @@ def load_transformer(
     from ltx_core.model.transformer.model_configurator import (
         LTXV_MODEL_COMFY_RENAMING_MAP,
         LTXModelConfigurator,
+        LTXVideoOnlyModelConfigurator,
     )
 
     return SingleGPUModelBuilder(
         model_path=str(checkpoint_path),
-        model_class_configurator=LTXModelConfigurator,
+        model_class_configurator=LTXVideoOnlyModelConfigurator if video_only else LTXModelConfigurator,
         model_sd_ops=LTXV_MODEL_COMFY_RENAMING_MAP,
     ).build(device=_to_torch_device(device), dtype=dtype)
 
